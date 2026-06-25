@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .agent import AgentEvent, PawliteAgent
+from .agent import PawliteAgent
 from .config import Config, DEFAULT_LANGUAGE
 
 
@@ -70,10 +70,6 @@ def main() -> int:
         if not task:
             continue
         _print_event_stream(agent.run_task_stream(task), raw_json=args.json, verbose=args.verbose)
-
-
-def _print_events(events: list[AgentEvent], *, raw_json: bool = False, verbose: bool = False) -> None:
-    _print_event_stream(iter(events), raw_json=raw_json, verbose=verbose)
 
 
 def _configure_console_encoding() -> None:
@@ -206,16 +202,6 @@ def _print_event_stream(events, *, raw_json: bool = False, verbose: bool = False
                 content = event.payload.get("content") or ""
                 label = "Planner output JSON" if actor == "planner" else "Executor output JSON"
                 print(f"\n[verbose] {label}:\n{content}", flush=True)
-        elif event.kind == "model_start":
-            if verbose:
-                print(f"\n[model step {event.payload['step']}] thinking...", flush=True)
-        elif event.kind == "model_delta":
-            continue
-        elif event.kind == "model":
-            if verbose:
-                thought = _thought_from_parsed(event.payload.get("parsed"))
-                if thought:
-                    print(f"[model] {thought}", flush=True)
         elif event.kind == "action":
             tool = event.payload["tool"]
             args = event.payload.get("args") or {}

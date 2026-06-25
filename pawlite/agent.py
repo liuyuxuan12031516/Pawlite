@@ -116,58 +116,40 @@ RECENT_OBSERVATIONS_TO_KEEP = 1
 PLANNER_SKILL_DESCRIPTION_MAX_CHARS = 500
 PLANNER_THINKING_BUDGET = 500
 REPORT_KEYS = ("task_title", "status", "summary", "artifacts", "coverage", "limitations", "suggested_next_steps")
-RESULT_SUMMARY_KEYS = (
-    "error",
+RESULT_METADATA_KEYS = (
     "path",
     "source_type",
     "total_files",
     "file_offset",
     "max_files",
+    "offset",
+    "next_offset",
+    "total_chars",
+    "max_tokens",
+    "max_chars",
+    "approx_tokens",
+    "has_more",
+    "next_file_offset",
+    "truncated",
+    "note",
+    "unsupported",
+    "output_path",
+    "work_dir",
+    "bytes",
+    "exit_code",
+)
+RESULT_SUMMARY_KEYS = (
+    "error",
+    *RESULT_METADATA_KEYS,
     "sheet_offset",
     "max_sheets",
     "row_offset",
     "max_rows_per_sheet",
-    "offset",
-    "next_offset",
-    "total_chars",
-    "max_tokens",
-    "max_chars",
-    "approx_tokens",
-    "has_more",
-    "next_file_offset",
-    "truncated",
-    "note",
-    "unsupported",
-    "output_path",
-    "work_dir",
-    "bytes",
-    "exit_code",
     "root",
     "query",
     "total_returned",
 )
-COMPACT_OBSERVATION_KEYS = (
-    "path",
-    "source_type",
-    "total_files",
-    "file_offset",
-    "max_files",
-    "offset",
-    "next_offset",
-    "total_chars",
-    "max_tokens",
-    "max_chars",
-    "approx_tokens",
-    "has_more",
-    "next_file_offset",
-    "truncated",
-    "note",
-    "unsupported",
-    "output_path",
-    "work_dir",
-    "bytes",
-    "exit_code",
-)
+COMPACT_OBSERVATION_KEYS = RESULT_METADATA_KEYS
 
 
 @dataclass
@@ -245,48 +227,23 @@ class PawliteAgent:
                     reason = action.get("reason", "") if isinstance(action, dict) else ""
                     name = str(action.get("name") or action.get("skill") or "").strip()
                     title = f"Read skill: {name or 'unknown'}"
-                    yield AgentEvent(
-                        "executor_start",
-                        {
-                            "planner_step": planner_step,
-                            "executor_index": index,
-                            "title": title,
-                            "reason": reason,
-                        },
-                    )
+                    yield self._executor_start_event(planner_step, index, title, reason)
                     report = self._read_planner_skill_report(name)
                     reports_this_step.append(report)
-                    yield AgentEvent(
-                        "executor_finish",
-                        {
-                            "planner_step": planner_step,
-                            "executor_index": index,
-                            "report": report,
-                        },
-                    )
+                    yield self._executor_finish_event(planner_step, index, report)
                     continue
 
                 work_order = self._work_order_from_action(action)
                 reason = action.get("reason", "") if isinstance(action, dict) else ""
-                yield AgentEvent(
-                    "executor_start",
-                    {
-                        "planner_step": planner_step,
-                        "executor_index": index,
-                        "title": work_order.get("title", f"subtask {index}"),
-                        "reason": reason,
-                    },
+                yield self._executor_start_event(
+                    planner_step,
+                    index,
+                    str(work_order.get("title", f"subtask {index}")),
+                    reason,
                 )
                 report = yield from self._run_executor(task, work_order, planner_step, index)
                 reports_this_step.append(report)
-                yield AgentEvent(
-                    "executor_finish",
-                    {
-                        "planner_step": planner_step,
-                        "executor_index": index,
-                        "report": report,
-                    },
-                )
+                yield self._executor_finish_event(planner_step, index, report)
 
             messages.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
             messages.append(
@@ -383,6 +340,29 @@ class PawliteAgent:
     @staticmethod
     def _is_read_skill_action(action: Any) -> bool:
         return isinstance(action, dict) and action.get("type") == "read_skill"
+
+    @staticmethod
+    def _executor_start_event(planner_step: int, executor_index: int, title: str, reason: str) -> AgentEvent:
+        return AgentEvent(
+            "executor_start",
+            {
+                "planner_step": planner_step,
+                "executor_index": executor_index,
+                "title": title,
+                "reason": reason,
+            },
+        )
+
+    @staticmethod
+    def _executor_finish_event(planner_step: int, executor_index: int, report: dict[str, Any]) -> AgentEvent:
+        return AgentEvent(
+            "executor_finish",
+            {
+                "planner_step": planner_step,
+                "executor_index": executor_index,
+                "report": report,
+            },
+        )
 
     def _read_planner_skill_report(self, name: str) -> dict[str, Any]:
         doc = self._read_planner_skill(name)
