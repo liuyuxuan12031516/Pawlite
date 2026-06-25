@@ -54,6 +54,8 @@ GENERIC_SEARCH_WORDS = {
     "找到",
     "所在",
 }
+READ_FILE_DEFAULT_MAX_TOKENS = 12000
+ESTIMATED_CHARS_PER_TOKEN = 4
 
 
 def _json_result(ok: bool, **payload: Any) -> ActionResult:
@@ -68,8 +70,9 @@ class SkillContext:
     vision_complete: Callable[[list[Path], str], str] | None = None
 
     def resolve_workspace_path(self, path: str) -> Path:
-        candidate = (self.workspace / path).resolve()
-        if not str(candidate).lower().startswith(str(self.workspace).lower()):
+        workspace = self.workspace.resolve()
+        candidate = (workspace / path).resolve()
+        if not str(candidate).lower().startswith(str(workspace).lower()):
             raise SkillError(f"Path escapes workspace: {path}")
         return candidate
 
@@ -136,8 +139,13 @@ class SkillRegistry:
             },
             {
                 "name": "read_file",
-                "description": "Read a UTF-8 text file inside the workspace.",
-                "args": {"path": "relative file path", "max_chars": "integer, default 12000"},
+                "description": "Read a UTF-8 text file inside the workspace. Supports offset paging for large files.",
+                "args": {
+                    "path": "relative file path",
+                    "offset": "character offset, default 0; use next_offset to continue a truncated read",
+                    "max_tokens": "approximate token budget, default 12000",
+                    "max_chars": "optional exact character budget; overrides max_tokens when provided",
+                },
             },
             {
                 "name": "write_file",
@@ -262,13 +270,40 @@ class SkillRegistry:
             max_depth=max_depth,
         )
 
-    def read_file(self, path: str, max_chars: int = 12000) -> ActionResult:
+    def read_file(
+        self,
+        path: str,
+        offset: int = 0,
+        max_tokens: int = READ_FILE_DEFAULT_MAX_TOKENS,
+        max_chars: int | None = None,
+    ) -> ActionResult:
         file_path = self.context.resolve_workspace_path(path)
         if not file_path.exists() or not file_path.is_file():
             return _json_result(False, error=f"File not found: {path}")
         data = file_path.read_text(encoding="utf-8", errors="replace")
-        truncated = len(data) > int(max_chars)
-        return _json_result(True, content=data[: int(max_chars)], truncated=truncated)
+        start = max(0, int(offset))
+        limit = int(max_chars) if max_chars is not None else max(1, int(max_tokens)) * ESTIMATED_CHARS_PER_TOKEN
+        end = min(len(data), start + max(1, limit))
+        truncated = end < len(data)
+        next_offset = end if truncated else None
+        return _json_result(
+            True,
+            path=file_path.relative_to(self.context.workspace.resolve()).as_posix(),
+            content=data[start:end],
+            offset=start,
+            next_offset=next_offset,
+            total_chars=len(data),
+            max_tokens=int(max_tokens),
+            max_chars=max(1, limit),
+            approx_tokens=max(1, (end - start + ESTIMATED_CHARS_PER_TOKEN - 1) // ESTIMATED_CHARS_PER_TOKEN),
+            truncated=truncated,
+            note=(
+                f"Content truncated. Continue with read_file(path={path!r}, offset={next_offset}) "
+                "to read the next chunk."
+                if truncated
+                else "Full file content returned."
+            ),
+        )
 
     def write_file(self, path: str, content: str) -> ActionResult:
         return self._save_text_file("write_file", path, content, append=False)

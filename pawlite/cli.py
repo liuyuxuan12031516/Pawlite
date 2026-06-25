@@ -85,7 +85,10 @@ def _configure_console_encoding() -> None:
 def _format_tool_line(tool: str, args: dict) -> str:
     if not args:
         return tool
-    if tool in {"read_file", "write_file", "append_file"}:
+    if tool == "read_file":
+        suffix = f"@{args.get('offset')}" if args.get("offset") else ""
+        return f"{tool}({args.get('path', '')}{suffix})"
+    if tool in {"write_file", "append_file"}:
         return f"{tool}({args.get('path', '')})"
     if tool == "list_files":
         return f"{tool}({args.get('path', '.')})"

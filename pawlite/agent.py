@@ -61,7 +61,7 @@ Rules:
 - For file-heavy work, preview first with small limits. For Excel paths, use read_excel with small max_files/max_sheets/max_rows_per_sheet/max_chars before requesting broader content.
 - For local file discovery tasks, delegate search_files or find_images with explicit roots and bounded max_depth/max_results before using broader shell commands.
 - For image understanding tasks, first find the image path if needed, then delegate describe_image with a focused prompt.
-- If the source is large or truncated, use task decomposition: process batches with offsets or smaller limits, extract task-relevant facts into compact intermediate notes, then synthesize from those notes.
+- If read_file returns truncated=true, continue the same file with read_file(path, offset=next_offset) until coverage is sufficient; extract task-relevant facts into compact intermediate notes instead of relying on one partial read.
 - Never ask an executor to save raw tool observations, raw Excel JSON, raw preview_rows, or full row dumps into intermediate files.
 - Intermediate files must contain extracted analysis notes, coverage metadata, or final artifacts. Keep them much shorter than source chunks and include provenance such as file name, sheet/page/row range, timestamp, or command output source.
 - Do not invent facts during synthesis. If source evidence is incomplete, ambiguous, or only summarized, mark it as uncertain instead of filling gaps with plausible details.
@@ -103,6 +103,7 @@ Rules:
 - Keep the subtask boundary. Do not continue into a new planner step.
 - Batch independent tool calls in one actions array when safe, so the subtask does not waste model steps on one tool at a time.
 - For long files, directories, Excel, logs, or reports, preview first and page through bounded chunks.
+- For large text files, read_file uses an approximate token budget and may return truncated=true; continue with offset=next_offset when the assigned task needs the rest of that file.
 - Use search_files for general local file lookup, find_images for image-name lookup, and describe_image for visual inspection.
 - Write compact intermediate notes under .pawlite_work/ only when they contain extracted task-relevant facts, not raw evidence copies.
 - Do not write raw tool observations, raw Excel JSON, preview_rows dumps, full row dumps, or long command output to intermediate files or final reports.
@@ -125,9 +126,16 @@ RESULT_SUMMARY_KEYS = (
     "max_sheets",
     "row_offset",
     "max_rows_per_sheet",
+    "offset",
+    "next_offset",
+    "total_chars",
+    "max_tokens",
+    "max_chars",
+    "approx_tokens",
     "has_more",
     "next_file_offset",
     "truncated",
+    "note",
     "unsupported",
     "output_path",
     "work_dir",
@@ -143,9 +151,16 @@ COMPACT_OBSERVATION_KEYS = (
     "total_files",
     "file_offset",
     "max_files",
+    "offset",
+    "next_offset",
+    "total_chars",
+    "max_tokens",
+    "max_chars",
+    "approx_tokens",
     "has_more",
     "next_file_offset",
     "truncated",
+    "note",
     "unsupported",
     "output_path",
     "work_dir",
