@@ -9,7 +9,11 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
+
+
+if TYPE_CHECKING:
+    from .config import Config
 
 
 Message = dict[str, Any]
@@ -27,6 +31,14 @@ class QwenClient:
     model: str
     timeout: int = 240
 
+    @classmethod
+    def from_config(cls, config: Config) -> QwenClient:
+        return cls(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            model=config.model,
+        )
+
     def complete(
         self,
         messages: list[Message],
@@ -35,7 +47,7 @@ class QwenClient:
         enable_thinking: bool | None = None,
     ) -> str:
         if not self.api_key:
-            raise QwenError("Missing API key. Set DASHSCOPE_API_KEY or QWEN_API_KEY.")
+            raise QwenError("Missing API key. Set DASHSCOPE_API_KEY in .env or system environment.")
         if self._uses_dashscope_native_api():
             try:
                 return self._complete_dashscope_native(
@@ -46,13 +58,7 @@ class QwenClient:
             except QwenError as exc:
                 if "url error" not in str(exc).lower():
                     raise
-                fallback = QwenClient(
-                    api_key=self.api_key,
-                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                    model=self.model,
-                    timeout=self.timeout,
-                )
-                return fallback._complete_openai_compatible(
+                return self._compatible_client()._complete_openai_compatible(
                     messages,
                     temperature=temperature,
                     enable_thinking=enable_thinking,
@@ -71,15 +77,9 @@ class QwenClient:
         enable_thinking: bool | None = None,
     ) -> Iterator[StreamDelta]:
         if not self.api_key:
-            raise QwenError("Missing API key. Set DASHSCOPE_API_KEY or QWEN_API_KEY.")
+            raise QwenError("Missing API key. Set DASHSCOPE_API_KEY in .env or system environment.")
         if self._uses_dashscope_native_api():
-            fallback = QwenClient(
-                api_key=self.api_key,
-                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                model=self.model,
-                timeout=self.timeout,
-            )
-            yield from fallback._stream_complete_openai_compatible(
+            yield from self._compatible_client()._stream_complete_openai_compatible(
                 messages,
                 temperature=temperature,
                 enable_thinking=enable_thinking,
@@ -108,18 +108,22 @@ class QwenClient:
                 ],
             }
         ]
-        client = self
-        if self._uses_dashscope_native_api():
-            client = QwenClient(
-                api_key=self.api_key,
-                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                model=self.model,
-                timeout=self.timeout,
-            )
+        client = self._compatible_client() if self._uses_dashscope_native_api() else self
         return client._complete_openai_compatible(
             messages,
             temperature=temperature,
             enable_thinking=enable_thinking,
+        )
+
+    def _compatible_client(self) -> QwenClient:
+        fallback_base_url = self.base_url
+        if self._uses_dashscope_native_api():
+            fallback_base_url = self.base_url.replace("/api/v1", "/compatible-mode/v1", 1)
+        return QwenClient(
+            api_key=self.api_key,
+            base_url=fallback_base_url,
+            model=self.model,
+            timeout=self.timeout,
         )
 
     def _uses_dashscope_native_api(self) -> bool:

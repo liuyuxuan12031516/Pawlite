@@ -271,24 +271,23 @@ class SkillRegistry:
         return _json_result(True, content=data[: int(max_chars)], truncated=truncated)
 
     def write_file(self, path: str, content: str) -> ActionResult:
-        file_path = self.context.resolve_workspace_path(path)
-        if self._reject_raw_work_dump(file_path, content):
-            return _json_result(False, error="Refusing to write raw tool output under .pawlite_work; write compact extracted notes instead.")
-        if not self.context.confirm("write_file", path):
-            return _json_result(False, error="User denied write_file")
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
-        return _json_result(True, path=file_path.relative_to(self.context.workspace).as_posix(), bytes=len(content.encode("utf-8")))
+        return self._save_text_file("write_file", path, content, append=False)
 
     def append_file(self, path: str, content: str) -> ActionResult:
+        return self._save_text_file("append_file", path, content, append=True)
+
+    def _save_text_file(self, action: str, path: str, content: str, *, append: bool) -> ActionResult:
         file_path = self.context.resolve_workspace_path(path)
         if self._reject_raw_work_dump(file_path, content):
-            return _json_result(False, error="Refusing to append raw tool output under .pawlite_work; append compact extracted notes instead.")
-        if not self.context.confirm("append_file", path):
-            return _json_result(False, error="User denied append_file")
+            return _json_result(False, error=f"Refusing to {action} raw tool output under .pawlite_work; write compact extracted notes instead.")
+        if not self.context.confirm(action, path):
+            return _json_result(False, error=f"User denied {action}")
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_path.open("a", encoding="utf-8") as handle:
-            handle.write(content)
+        if append:
+            with file_path.open("a", encoding="utf-8") as handle:
+                handle.write(content)
+        else:
+            file_path.write_text(content, encoding="utf-8")
         return _json_result(True, path=file_path.relative_to(self.context.workspace).as_posix(), bytes=len(content.encode("utf-8")))
 
     def describe_image(self, paths: str | list[str], prompt: str = "Describe the image.", max_images: int = 4) -> ActionResult:

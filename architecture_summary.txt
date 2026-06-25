@@ -1,0 +1,91 @@
+# Pawlite 项目架构总结报告
+
+## 1. 项目概述
+Pawlite 是一个基于本地工作区的个人助理代理系统（版本 0.3.0）。它采用 Planner-Executor（规划器-执行器）分离的架构，通过大语言模型（Qwen/DashScope）进行任务规划，并利用本地技能集（Skills）执行文件操作、搜索、记忆管理等具体任务。系统支持命令行交互和单次任务模式，具备流式输出和本地持久化记忆能力。
+
+## 2. 核心模块职责
+
+### 2.1 Agent (pawlite/agent.py)
+- **角色**: 系统核心大脑，协调规划与执行循环。
+- **关键组件**: `PawliteAgent` 类，包含 `PLANNER_SYSTEM_PROMPT` 和 `EXECUTOR_SYSTEM_PROMPT`。
+- **职责**: 
+  - 维护代理状态和上下文。
+  - 调用 `QwenClient` 进行任务规划，解析 JSON 格式的规划结果。
+  - 根据规划调度 `SkillRegistry` 执行子任务。
+  - 处理流式事件 (`AgentEvent`) 和错误恢复。
+- **设计特点**: 采用 Planner-Executor 分离模式，通过 JSON 协议通信，支持流式事件输出。
+
+### 2.2 Skills (pawlite/skills.py)
+- **角色**: 执行引擎与工具注册表。
+- **关键组件**: `SkillRegistry`, `SkillContext`。
+- **职责**:
+  - 注册和管理所有可用技能（如 `read_file`, `search_files`, `run_shell`, `remember` 等）。
+  - 提供技能清单 (`manifest`) 供规划器了解能力边界。
+  - 执行具体的 Python 函数调用，并返回标准化的 `ActionResult`。
+  - 实施安全机制：工作区路径校验、危险操作确认。
+- **内置技能**: 包括文件读写、搜索、Excel解析、图像描述、记忆管理、Shell执行等。
+
+### 2.3 Config (pawlite/config.py)
+- **角色**: 配置管理中心。
+- **关键组件**: `Config` dataclass, `from_env` 工厂方法。
+- **职责**:
+  - 从 CLI 参数、`.env` 文件、环境变量中加载配置。
+  - 遵循优先级策略：CLI > dotenv > env > default。
+  - 提供不可变配置对象，确保运行时配置安全。
+- **依赖管理**: 项目中未发现显式的依赖声明文件（如 requirements.txt），可能依赖环境隐式安装。
+
+### 2.4 Memory (pawlite/memory.py)
+- **角色**: 本地持久化记忆存储。
+- **关键组件**: `Memory` dataclass。
+- **职责**:
+  - 基于 JSON 文件 (`.pawlite_memory.json`) 存储时间序列记忆。
+  - 支持添加记忆、关键词搜索和获取最近记录。
+  - 自动截断机制，保留最近 200 条记录以控制文件大小。
+
+### 2.5 Client (pawlite/qwen_client.py)
+- **角色**: LLM 交互适配器。
+- **关键组件**: `QwenClient` 类。
+- **职责**:
+  - 封装与 Qwen API (DashScope 或 OpenAI 兼容接口) 的 HTTP 通信。
+  - 支持文本生成、流式响应 (SSE) 和多模态图像输入 (Base64)。
+  - 内置重试机制和错误处理。
+
+### 2.6 CLI (pawlite/cli.py)
+- **角色**: 用户交互入口。
+- **关键组件**: `main()`, `build_parser()`, `_print_event_stream()`。
+- **职责**:
+  - 解析命令行参数，初始化 `Config` 和 `PawliteAgent`。
+  - 支持单次任务模式和交互式循环模式。
+  - 格式化并打印代理产生的事件流（规划、执行、动作、结果等）。
+
+### 2.7 Entry Point (pawlite/__main__.py)
+- **角色**: 程序入口。
+- **职责**: 极其精简，仅导入并执行 `cli.main()`，表明项目采用标准的 Python 包入口模式。
+
+## 3. 模块间交互流程
+1. **启动**: `__main__.py` 调用 `cli.main()`。
+2. **初始化**: `cli` 加载 `Config`，实例化 `Memory`, `QwenClient`, `SkillRegistry`，并创建 `PawliteAgent`。
+3. **任务接收**: 用户通过 CLI 输入任务或文本。
+4. **规划**: `PawliteAgent` 将任务发送给 `QwenClient`，使用 `PLANNER_SYSTEM_PROMPT` 获取结构化规划（JSON）。
+   - Planner 返回 `delegate` 类型的动作，包含子任务的标题、目标和指令。
+5. **执行循环**:
+   - `PawliteAgent` 调用 `SkillRegistry` 执行具体技能（Executor 模式）。
+   - 技能执行结果反馈给 Agent，更新上下文。
+   - Executor 返回 compact report（status/summary/artifacts/limitations）。
+   - Agent 可能再次调用 LLM 进行下一步规划，直到任务完成。
+6. **输出**: `cli` 层通过 `_print_event_stream` 实时展示过程。
+7. **持久化**: 关键信息通过 `remember` 技能存入 `Memory` 模块。
+
+## 4. 关键设计模式与安全机制
+
+### 4.1 设计模式
+- **Planner-Executor 分离**: 将“思考”（规划）与“行动”（执行）解耦，提高复杂任务的处理能力。两者通过统一的 JSON 协议通信，但 Planner 使用 `delegate`，Executor 使用具体 `tool` 名。
+- **插件化技能系统**: 通过 `SkillRegistry` 动态管理工具，便于扩展新功能。
+- **适配器模式**: `QwenClient` 屏蔽不同 LLM API 的差异，提供统一接口。
+- **不可变配置**: 使用 frozen dataclass 确保配置在运行时不被意外修改。
+
+### 4.2 依赖与安全机制
+- **沙箱安全机制**: 技能执行前校验文件路径是否在工作区内，防止越权访问。
+- **危险操作确认**: `write_file` 和 `run_shell` 等高风险操作默认需要用户确认（可通过 `--yes` 跳过）。
+- **上下文管理**: 复杂任务的长文本或 Excel 数据建议写到 `.pawlite_work/` 做中间笔记，避免将原始工具输出整坨塞入 LLM 上下文，从而节省 Token 并提高稳定性。
+- **依赖缺失**: 项目缺乏显式的依赖声明文件（如 pyproject.toml 或 requirements.txt），这可能影响项目的可移植性和自动化部署。

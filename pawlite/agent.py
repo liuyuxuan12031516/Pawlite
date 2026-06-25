@@ -21,7 +21,7 @@ Return ONLY one JSON object, no markdown, no commentary.
 
 JSON protocol:
 {
-  "thought": "brief visible planner progress summary, not private chain-of-thought",
+  "thought": "one short visible planner status sentence, not reasoning or self-checking",
   "final": "short final answer when the task is complete, otherwise null",
   "actions": [
     {
@@ -39,10 +39,13 @@ JSON protocol:
 }
 
 Rules:
-- Keep thought concise and describe only visible planning/progress.
+- Keep thought to one short sentence. Do not include chain-of-thought, self-correction, format checks, or "I will output" commentary.
+- Decide silently first, then return only the JSON object.
 - Delegate at most one subtask per planner step unless the subtasks are tiny and independent.
+- Keep each delegated subtask small enough for the executor step budget. Prefer focused batches over one oversized "read everything" task.
 - Do not ask the executor to return raw source text. Ask it to write compact intermediate notes when evidence is long.
 - Maintain the global plan and completion state from executor reports only.
+- Do not claim a requirement is complete unless the executor report confirms it. Memory may guide planning, but it must not replace required reads or verification unless the user explicitly allows that shortcut.
 - When the task is done, set final to a concise answer and actions to [].
 - For complex, multi-step, long-context, directory, data-analysis, or report-generation tasks, use the planner-only workflow guidance from the user message before loading large content.
 - Separate planning from execution: create a high-level plan, preview the source, revise the remaining plan from executor reports, then execute bounded chunks.
@@ -64,7 +67,7 @@ Return ONLY one JSON object, no markdown, no commentary.
 
 JSON protocol:
 {
-  "thought": "brief visible executor progress summary, not private chain-of-thought",
+  "thought": "one short visible executor status sentence, not reasoning or self-checking",
   "final": null,
   "actions": [
     {"tool": "skill name", "args": {"key": "value"}, "reason": "why this action is needed"}
@@ -86,7 +89,10 @@ When the assigned subtask is complete, return:
 }
 
 Rules:
+- Keep thought to one short sentence. Do not include chain-of-thought, self-correction, format checks, or "I will output" commentary.
+- Decide silently first, then return only the JSON object.
 - Keep the subtask boundary. Do not continue into a new planner step.
+- Batch independent tool calls in one actions array when safe, so the subtask does not waste model steps on one tool at a time.
 - For long files, directories, Excel, logs, or reports, preview first and page through bounded chunks.
 - Use search_files for general local file lookup, find_images for image-name lookup, and describe_image for visual inspection.
 - Write compact intermediate notes under .pawlite_work/ only when they contain extracted task-relevant facts, not raw evidence copies.
@@ -97,6 +103,45 @@ Rules:
 
 OLD_OBSERVATION_MAX_CHARS = 4000
 RECENT_OBSERVATIONS_TO_KEEP = 1
+REPORT_KEYS = ("task_title", "status", "summary", "artifacts", "coverage", "limitations", "suggested_next_steps")
+RESULT_SUMMARY_KEYS = (
+    "error",
+    "path",
+    "source_type",
+    "total_files",
+    "file_offset",
+    "max_files",
+    "sheet_offset",
+    "max_sheets",
+    "row_offset",
+    "max_rows_per_sheet",
+    "has_more",
+    "next_file_offset",
+    "truncated",
+    "unsupported",
+    "output_path",
+    "work_dir",
+    "bytes",
+    "exit_code",
+    "root",
+    "query",
+    "total_returned",
+)
+COMPACT_OBSERVATION_KEYS = (
+    "path",
+    "source_type",
+    "total_files",
+    "file_offset",
+    "max_files",
+    "has_more",
+    "next_file_offset",
+    "truncated",
+    "unsupported",
+    "output_path",
+    "work_dir",
+    "bytes",
+    "exit_code",
+)
 
 
 @dataclass
@@ -109,11 +154,7 @@ class PawliteAgent:
     def __init__(self, config: Config):
         self.config = config
         self.memory = Memory(config.memory_path)
-        self.client = QwenClient(
-            api_key=config.api_key,
-            base_url=config.base_url,
-            model=config.model,
-        )
+        self.client = QwenClient.from_config(config)
         self.skills = SkillRegistry(
             SkillContext(
                 workspace=config.workspace,
@@ -143,25 +184,14 @@ class PawliteAgent:
 
         for planner_step in range(1, self.config.max_steps + 1):
             try:
-                yield AgentEvent("planner_start", {"step": planner_step})
-                if self.config.stream:
-                    raw_parts = []
-                    for delta in self.client.stream_complete(messages):
-                        content = self._delta_content(delta)
-                        reasoning = self._delta_reasoning(delta)
-                        raw_parts.append(content)
-                        yield AgentEvent(
-                            "planner_delta",
-                            {
-                                "step": planner_step,
-                                "content": content,
-                                "reasoning": reasoning,
-                            },
-                        )
-                    raw_text = "".join(raw_parts) or self.client.complete(messages)
-                else:
-                    raw_text = self.client.complete(messages)
-                    yield AgentEvent("planner_delta", {"step": planner_step, "content": raw_text})
+                raw_text = yield from self._model_turn(
+                    messages,
+                    actor="planner",
+                    start_kind="planner_start",
+                    delta_kind="planner_delta",
+                    start_payload={"step": planner_step},
+                    delta_payload={"step": planner_step},
+                )
             except QwenError as exc:
                 yield AgentEvent("error", {"message": str(exc)})
                 return
@@ -251,7 +281,7 @@ class PawliteAgent:
                 },
                 {
                     "step": "execute_chunks",
-                    "goal": "Delegate one bounded batch at a time and require task-relevant extraction, not raw source copying.",
+                    "goal": "Delegate one bounded batch at a time, sized to the executor step budget, and require task-relevant extraction, not raw source copying.",
                 },
                 {
                     "step": "synthesize",
@@ -288,8 +318,42 @@ class PawliteAgent:
         return (
             base_prompt
             + "\nLanguage policy:\n"
-            + f"- Use {self.config.language} for visible reasoning summaries, plans, tool-written artifacts, and final user-facing output unless the user explicitly requests another language.\n"
-            + "- Keep the JSON protocol field names exactly as specified.\n"
+            + f"- 所有 JSON 字符串字段（thought、reason、summary、instructions、title、objective 等）必须使用{self.config.language}。\n"
+            + f"- All JSON string values (thought, reason, summary, instructions, title, objective, etc.) must be written in {self.config.language}.\n"
+            + "- 仅 JSON 字段名、代码路径、API 名、文件名可保留英文。\n"
+            + "- Keep JSON protocol field names exactly as specified.\n"
+            + "- Do not write English reasoning unless the user explicitly requests another language.\n"
+        )
+
+    def _messages_for_call(self, messages: list[dict[str, str]], *, actor: str) -> list[dict[str, str]]:
+        return [
+            *messages,
+            {
+                "role": "user",
+                "content": self._call_guardrail(actor),
+            },
+        ]
+
+    def _call_guardrail(self, actor: str) -> str:
+        if actor == "planner":
+            role_rules = (
+                "- 只给下一步决策：继续委托一个小任务，或在已确认完成时 final。\n"
+                "- 每个委托任务要适合 executor 的步数预算；文件很多时按小批次推进。\n"
+                "- 不要因为已有 memory 就跳过用户明确要求的读取/验证步骤，除非 final 中说明限制。"
+            )
+        else:
+            role_rules = (
+                "- 只执行当前子任务，不扩展到新的 planner 步骤。\n"
+                "- 安全且相互独立的工具调用可以放进同一个 actions 数组，避免每轮只调用一个工具。\n"
+                "- 如果证据不足，报告 partial/blocked，不要把未完成的要求说成已完成。"
+            )
+        return (
+            "本次调用强制约束：\n"
+            f"- 所有 JSON 字符串值必须使用{self.config.language}；JSON 字段名保持协议原样。\n"
+            "- thought 只写一句可见状态，最多 60 个中文字符；不要写推理过程、自我修正、格式检查或准备输出。\n"
+            "- 不要输出 markdown、代码块、额外解释、英文思考、Wait/Self-Correction/Verification 等内容。\n"
+            "- 先在内部完成判断，再只返回一个合法 JSON 对象。\n"
+            f"{role_rules}"
         )
 
     def _with_language_instruction(self, prompt: str) -> str:
@@ -297,6 +361,64 @@ class PawliteAgent:
             f"请使用{self.config.language}完成分析和输出，除非用户明确要求其他语言。\n"
             f"{prompt}"
         )
+
+    def _stream_or_complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        event_kind: str,
+        event_payload: dict[str, Any],
+        enable_thinking: bool | None = None,
+    ) -> Iterator[AgentEvent | str]:
+        raw_parts: list[str] = []
+        try:
+            for delta in self.client.stream_complete(messages, enable_thinking=enable_thinking):
+                content = self._delta_content(delta)
+                reasoning = self._delta_reasoning(delta)
+                raw_parts.append(content)
+                yield AgentEvent(
+                    event_kind,
+                    {
+                        **event_payload,
+                        "content": content,
+                        "reasoning": reasoning,
+                    },
+                )
+            raw_text = "".join(raw_parts)
+            if raw_text:
+                return raw_text
+        except QwenError:
+            pass
+        raw_text = self.client.complete(messages, enable_thinking=enable_thinking)
+        yield AgentEvent(event_kind, {**event_payload, "content": raw_text, "reasoning": ""})
+        return raw_text
+
+    def _model_turn(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        actor: str,
+        start_kind: str,
+        delta_kind: str,
+        start_payload: dict[str, Any],
+        delta_payload: dict[str, Any],
+        enable_thinking: bool | None = None,
+    ) -> Iterator[AgentEvent | str]:
+        yield AgentEvent(start_kind, start_payload)
+        call_messages = self._messages_for_call(messages, actor=actor)
+        if self.config.stream:
+            return (
+                yield from self._stream_or_complete(
+                    call_messages,
+                    event_kind=delta_kind,
+                    event_payload=delta_payload,
+                    enable_thinking=enable_thinking,
+                )
+            )
+
+        raw_text = self.client.complete(call_messages, enable_thinking=enable_thinking)
+        yield AgentEvent(delta_kind, {**delta_payload, "content": raw_text, "reasoning": ""})
+        return raw_text
 
     def _run_executor(
         self,
@@ -312,42 +434,20 @@ class PawliteAgent:
 
         for executor_step in range(1, self.config.max_steps + 1):
             try:
-                yield AgentEvent(
-                    "executor_model_start",
-                    {
-                        "planner_step": planner_step,
-                        "executor_index": executor_index,
-                        "executor_step": executor_step,
-                    },
+                event_payload = {
+                    "planner_step": planner_step,
+                    "executor_index": executor_index,
+                    "executor_step": executor_step,
+                }
+                raw_text = yield from self._model_turn(
+                    messages,
+                    actor="executor",
+                    start_kind="executor_model_start",
+                    delta_kind="executor_delta",
+                    start_payload=event_payload,
+                    delta_payload=event_payload,
+                    enable_thinking=False,
                 )
-                if self.config.stream:
-                    raw_parts = []
-                    for delta in self.client.stream_complete(messages, enable_thinking=False):
-                        content = self._delta_content(delta)
-                        reasoning = self._delta_reasoning(delta)
-                        raw_parts.append(content)
-                        yield AgentEvent(
-                            "executor_delta",
-                            {
-                                "planner_step": planner_step,
-                                "executor_index": executor_index,
-                                "executor_step": executor_step,
-                                "content": content,
-                                "reasoning": reasoning,
-                            },
-                        )
-                    raw_text = "".join(raw_parts) or self.client.complete(messages, enable_thinking=False)
-                else:
-                    raw_text = self.client.complete(messages, enable_thinking=False)
-                    yield AgentEvent(
-                        "executor_delta",
-                        {
-                            "planner_step": planner_step,
-                            "executor_index": executor_index,
-                            "executor_step": executor_step,
-                            "content": raw_text,
-                        },
-                    )
             except QwenError as exc:
                 return self._executor_report(
                     work_order,
@@ -470,7 +570,7 @@ class PawliteAgent:
     @staticmethod
     def _sanitize_report(report: dict[str, Any]) -> dict[str, Any]:
         compact: dict[str, Any] = {}
-        for key in ("task_title", "status", "summary", "artifacts", "coverage", "limitations", "suggested_next_steps"):
+        for key in REPORT_KEYS:
             value = report.get(key)
             if isinstance(value, str):
                 compact[key] = value[:2000]
@@ -495,29 +595,7 @@ class PawliteAgent:
     @classmethod
     def _summarize_result(cls, result: dict[str, Any]) -> dict[str, Any]:
         summary: dict[str, Any] = {"ok": result.get("ok")}
-        for key in (
-            "error",
-            "path",
-            "source_type",
-            "total_files",
-            "file_offset",
-            "max_files",
-            "sheet_offset",
-            "max_sheets",
-            "row_offset",
-            "max_rows_per_sheet",
-            "has_more",
-            "next_file_offset",
-            "truncated",
-            "unsupported",
-            "output_path",
-            "work_dir",
-            "bytes",
-            "exit_code",
-            "root",
-            "query",
-            "total_returned",
-        ):
+        for key in RESULT_SUMMARY_KEYS:
             if key in result:
                 summary[key] = result[key]
         if "content" in result:
@@ -632,21 +710,7 @@ class PawliteAgent:
                 "args": item.get("args", {}),
                 "ok": result.get("ok"),
             }
-            for key in (
-                "path",
-                "source_type",
-                "total_files",
-                "file_offset",
-                "max_files",
-                "has_more",
-                "next_file_offset",
-                "truncated",
-                "unsupported",
-                "output_path",
-                "work_dir",
-                "bytes",
-                "exit_code",
-            ):
+            for key in COMPACT_OBSERVATION_KEYS:
                 if key in result:
                     summary[key] = result[key]
             if "files" in result and isinstance(result["files"], list):
