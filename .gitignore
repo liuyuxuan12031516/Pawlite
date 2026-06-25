@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.pawlite_memory.json
+.pawlite_work/
+.openclaw_memory.json
+.openclaw_work/
+demo_output.txt
+hello_pawlite.txt
+hello_openclaw.txt
