@@ -61,7 +61,7 @@ Rules:
 - For file-heavy work, preview first with small limits. For Excel paths, use read_excel with small max_files/max_sheets/max_rows_per_sheet/max_chars before requesting broader content.
 - For local file discovery tasks, delegate search_files or find_images with explicit roots and bounded max_depth/max_results before using broader shell commands.
 - For image understanding tasks, first find the image path if needed, then delegate describe_image with a focused prompt.
-- If read_file returns truncated=true, continue the same file with read_file(path, offset=next_offset) until coverage is sufficient; extract task-relevant facts into compact intermediate notes instead of relying on one partial read.
+- read_file has a large default budget for ordinary source files. If read_file returns truncated=true, continue the same file with read_file(path, offset=next_offset) until coverage is sufficient; extract task-relevant facts into compact intermediate notes instead of relying on one partial read.
 - Never ask an executor to save raw tool observations, raw Excel JSON, raw preview_rows, or full row dumps into intermediate files.
 - Intermediate files must contain extracted analysis notes, coverage metadata, or final artifacts. Keep them much shorter than source chunks and include provenance such as file name, sheet/page/row range, timestamp, or command output source.
 - Do not invent facts during synthesis. If source evidence is incomplete, ambiguous, or only summarized, mark it as uncertain instead of filling gaps with plausible details.
@@ -102,8 +102,8 @@ Rules:
 - Decide silently first, then return only the JSON object.
 - Keep the subtask boundary. Do not continue into a new planner step.
 - Batch independent tool calls in one actions array when safe, so the subtask does not waste model steps on one tool at a time.
-- For long files, directories, Excel, logs, or reports, preview first and page through bounded chunks.
-- For large text files, read_file uses an approximate token budget and may return truncated=true; continue with offset=next_offset when the assigned task needs the rest of that file.
+- For long directories, Excel, logs, reports, or data-like files, preview first and page through bounded chunks.
+- read_file has a large default budget for ordinary source files. If it returns truncated=true, continue with offset=next_offset when the assigned task needs the rest of that file.
 - Use search_files for general local file lookup, find_images for image-name lookup, and describe_image for visual inspection.
 - Write compact intermediate notes under .pawlite_work/ only when they contain extracted task-relevant facts, not raw evidence copies.
 - Do not write raw tool observations, raw Excel JSON, preview_rows dumps, full row dumps, or long command output to intermediate files or final reports.
@@ -114,6 +114,7 @@ Rules:
 OLD_OBSERVATION_MAX_CHARS = 4000
 RECENT_OBSERVATIONS_TO_KEEP = 1
 PLANNER_SKILL_DESCRIPTION_MAX_CHARS = 500
+PLANNER_THINKING_BUDGET = 500
 REPORT_KEYS = ("task_title", "status", "summary", "artifacts", "coverage", "limitations", "suggested_next_steps")
 RESULT_SUMMARY_KEYS = (
     "error",
@@ -216,6 +217,8 @@ class PawliteAgent:
                     delta_kind="planner_delta",
                     start_payload={"step": planner_step},
                     delta_payload={"step": planner_step},
+                    enable_thinking=True,
+                    thinking_budget=PLANNER_THINKING_BUDGET,
                 )
             except QwenError as exc:
                 yield AgentEvent("error", {"message": str(exc)})
@@ -517,13 +520,20 @@ class PawliteAgent:
         event_kind: str,
         event_payload: dict[str, Any],
         enable_thinking: bool | None = None,
+        thinking_budget: int | None = None,
     ) -> Iterator[AgentEvent | str]:
         raw_parts: list[str] = []
+        reasoning_parts: list[str] = []
         try:
-            for delta in self.client.stream_complete(messages, enable_thinking=enable_thinking):
+            for delta in self.client.stream_complete(
+                messages,
+                enable_thinking=enable_thinking,
+                thinking_budget=thinking_budget,
+            ):
                 content = self._delta_content(delta)
                 reasoning = self._delta_reasoning(delta)
                 raw_parts.append(content)
+                reasoning_parts.append(reasoning)
                 yield AgentEvent(
                     event_kind,
                     {
@@ -534,12 +544,16 @@ class PawliteAgent:
                 )
             raw_text = "".join(raw_parts)
             if raw_text:
-                return raw_text
+                return {"content": raw_text, "reasoning": "".join(reasoning_parts)}
         except QwenError:
             pass
-        raw_text = self.client.complete(messages, enable_thinking=enable_thinking)
+        raw_text = self.client.complete(
+            messages,
+            enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
+        )
         yield AgentEvent(event_kind, {**event_payload, "content": raw_text, "reasoning": ""})
-        return raw_text
+        return {"content": raw_text, "reasoning": ""}
 
     def _model_turn(
         self,
@@ -551,21 +565,55 @@ class PawliteAgent:
         start_payload: dict[str, Any],
         delta_payload: dict[str, Any],
         enable_thinking: bool | None = None,
+        thinking_budget: int | None = None,
     ) -> Iterator[AgentEvent | str]:
         yield AgentEvent(start_kind, start_payload)
         call_messages = self._messages_for_call(messages, actor=actor)
+        yield AgentEvent(
+            "model_input",
+            {
+                **start_payload,
+                "actor": actor,
+                "enable_thinking": enable_thinking,
+                "thinking_budget": thinking_budget,
+                "messages": call_messages,
+            },
+        )
         if self.config.stream:
-            return (
-                yield from self._stream_or_complete(
-                    call_messages,
-                    event_kind=delta_kind,
-                    event_payload=delta_payload,
-                    enable_thinking=enable_thinking,
-                )
+            output = yield from self._stream_or_complete(
+                call_messages,
+                event_kind=delta_kind,
+                event_payload=delta_payload,
+                enable_thinking=enable_thinking,
+                thinking_budget=thinking_budget,
             )
+            raw_text = output["content"]
+            yield AgentEvent(
+                "model_output",
+                {
+                    **delta_payload,
+                    "actor": actor,
+                    "content": raw_text,
+                    "reasoning": output.get("reasoning", ""),
+                },
+            )
+            return raw_text
 
-        raw_text = self.client.complete(call_messages, enable_thinking=enable_thinking)
+        raw_text = self.client.complete(
+            call_messages,
+            enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
+        )
         yield AgentEvent(delta_kind, {**delta_payload, "content": raw_text, "reasoning": ""})
+        yield AgentEvent(
+            "model_output",
+            {
+                **delta_payload,
+                "actor": actor,
+                "content": raw_text,
+                "reasoning": "",
+            },
+        )
         return raw_text
 
     def _run_executor(

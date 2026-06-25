@@ -54,8 +54,8 @@ GENERIC_SEARCH_WORDS = {
     "找到",
     "所在",
 }
-READ_FILE_DEFAULT_MAX_TOKENS = 12000
 ESTIMATED_CHARS_PER_TOKEN = 4
+READ_FILE_DEFAULT_MAX_TOKENS = 50000
 
 
 def _json_result(ok: bool, **payload: Any) -> ActionResult:
@@ -139,11 +139,11 @@ class SkillRegistry:
             },
             {
                 "name": "read_file",
-                "description": "Read a UTF-8 text file inside the workspace. Supports offset paging for large files.",
+                "description": "Read a UTF-8 text file inside the workspace. Supports offset paging for very large files.",
                 "args": {
                     "path": "relative file path",
                     "offset": "character offset, default 0; use next_offset to continue a truncated read",
-                    "max_tokens": "approximate token budget, default 12000",
+                    "max_tokens": "approximate token budget, default 50000",
                     "max_chars": "optional exact character budget; overrides max_tokens when provided",
                 },
             },

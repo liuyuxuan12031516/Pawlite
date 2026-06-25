@@ -1,105 +1,99 @@
 import sys
 import os
-import json
+import tempfile
 from pathlib import Path
 
-# 确保可以导入项目模块
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 添加项目根目录到路径
+sys.path.insert(0, str(Path(__file__).parent))
 
-def test_config_loading():
-    """测试配置加载"""
-    try:
-        from pawlite.config import Config
-        workspace = Path.cwd()
-        config = Config.from_env(workspace)
-        assert config is not None, "配置对象不应为空"
-        assert hasattr(config, 'api_key'), "配置应包含api_key"
-        print("[PASS] 配置加载成功")
-        return True
-    except Exception as e:
-        print(f"[FAIL] 配置加载失败: {e}")
-        return False
+from pawlite.config import Config
+from pawlite.memory import Memory
+from pawlite.skills import SkillRegistry, SkillContext
+from pawlite.agent import PawliteAgent
 
-def test_memory_operations():
-    """测试记忆读写"""
-    try:
-        from pawlite.memory import Memory
-        test_path = Path(".pawlite_work/test_memory.json")
-        test_path.parent.mkdir(parents=True, exist_ok=True)
-        mem = Memory(path=test_path)
-        
-        # 清理旧数据
-        if test_path.exists():
-            test_path.unlink()
-            
-        test_content = "test_value_123"
-        mem.add(kind="test", content=test_content)
-        
-        # 验证文件存在且内容正确
-        assert test_path.exists(), "记忆文件未创建"
-        data = json.loads(test_path.read_text(encoding="utf-8"))
-        assert len(data) > 0, "记忆列表为空"
-        assert data[-1]['content'] == test_content, "记忆内容不匹配"
-        
-        print("[PASS] 记忆读写成功")
-        return True
-    except Exception as e:
-        print(f"[FAIL] 记忆操作失败: {e}")
-        return False
+def test_config_initialization():
+    """测试 Config 初始化"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        config = Config.from_env(workspace, api_key="test_key", offline=True)
+        assert config.api_key == "test_key"
+        assert config.workspace == workspace.resolve()
+        assert config.offline is True
+        print("Config 初始化测试通过")
 
-def test_skill_registration():
-    """测试技能注册"""
-    try:
-        from pawlite.skills import SkillRegistry, SkillContext, Memory
-        from pathlib import Path
+def test_memory_read_write():
+    """测试 Memory 读写"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mem_path = Path(tmpdir) / "memory.json"
+        memory = Memory(mem_path)
         
-        workspace = Path.cwd()
-        memory = Memory(path=workspace / ".pawlite_work/test_skill_memory.json")
-        context = SkillContext(workspace=workspace, memory=memory, require_confirm=False)
-        registry = SkillRegistry(context=context)
+        # 测试添加
+        item = memory.add("test_kind", "test_content")
+        assert item["kind"] == "test_kind"
+        assert item["content"] == "test_content"
         
-        # 验证默认技能已注册
-        assert "list_files" in registry._skills, "默认技能 list_files 未注册"
-        assert "read_file" in registry._skills, "默认技能 read_file 未注册"
+        # 测试读取
+        recent = memory.recent(limit=1)
+        assert len(recent) == 1
+        assert recent[0]["content"] == "test_content"
         
-        print("[PASS] 技能注册成功")
-        return True
-    except Exception as e:
-        print(f"[FAIL] 技能注册失败: {e}")
-        return False
+        # 测试搜索
+        hits = memory.search("test_content")
+        assert len(hits) == 1
+        
+        print("Memory 读写测试通过")
+
+def test_skill_registry():
+    """测试 SkillRegistry 注册和基本功能"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        mem_path = workspace / "memory.json"
+        memory = Memory(mem_path)
+        context = SkillContext(
+            workspace=workspace,
+            memory=memory,
+            require_confirm=False
+        )
+        registry = SkillRegistry(context)
+        
+        # 测试 manifest
+        manifest = registry.manifest
+        assert isinstance(manifest, list)
+        assert len(manifest) > 0
+        
+        # 测试 now 技能
+        result = registry.run("now", {})
+        assert result["ok"] is True
+        assert "time" in result
+        
+        # 测试 list_files 技能
+        result = registry.run("list_files", {"path": "."})
+        assert result["ok"] is True
+        
+        print("SkillRegistry 测试通过")
 
 def test_agent_initialization():
-    """测试代理初始化"""
-    try:
-        from pawlite.agent import PawliteAgent
-        from pawlite.config import Config
-        from pathlib import Path
+    """测试 PawliteAgent 初始化"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        config = Config.from_env(workspace, api_key="test_key", offline=True)
+        agent = PawliteAgent(config)
         
-        workspace = Path.cwd()
-        config = Config.from_env(workspace)
-        # 设置为离线模式或确保有API key，这里主要测试初始化结构
-        # 如果没API key，初始化可能会在client处失败，但我们只测到skills注册
-        agent = PawliteAgent(config=config)
+        assert agent.config == config
+        assert agent.memory is not None
+        assert agent.skills is not None
         
-        assert agent.config is not None, "代理配置不应为空"
-        assert agent.skills is not None, "代理技能注册器不应为空"
-        assert agent.memory is not None, "代理记忆模块不应为空"
-        
-        print("[PASS] 代理初始化成功")
-        return True
-    except Exception as e:
-        print(f"[FAIL] 代理初始化失败: {e}")
-        return False
+        print("PawliteAgent 初始化测试通过")
 
 if __name__ == "__main__":
-    results = []
-    results.append(test_config_loading())
-    results.append(test_memory_operations())
-    results.append(test_skill_registration())
-    results.append(test_agent_initialization())
-    
-    if all(results):
-        print("\n所有测试通过！")
-    else:
-        print("\n存在失败的测试，请检查日志。")
+    try:
+        test_config_initialization()
+        test_memory_read_write()
+        test_skill_registry()
+        test_agent_initialization()
+        print("\n所有测试用例通过！")
+    except Exception as e:
+        print(f"\n测试失败: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)

@@ -45,6 +45,7 @@ class QwenClient:
         *,
         temperature: float = 0.2,
         enable_thinking: bool | None = None,
+        thinking_budget: int | None = None,
     ) -> str:
         if not self.api_key:
             raise QwenError("Missing API key. Set DASHSCOPE_API_KEY in .env or system environment.")
@@ -54,6 +55,7 @@ class QwenClient:
                     messages,
                     temperature=temperature,
                     enable_thinking=enable_thinking,
+                    thinking_budget=thinking_budget,
                 )
             except QwenError as exc:
                 if "url error" not in str(exc).lower():
@@ -62,11 +64,13 @@ class QwenClient:
                     messages,
                     temperature=temperature,
                     enable_thinking=enable_thinking,
+                    thinking_budget=thinking_budget,
                 )
         return self._complete_openai_compatible(
             messages,
             temperature=temperature,
             enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
         )
 
     def stream_complete(
@@ -75,6 +79,7 @@ class QwenClient:
         *,
         temperature: float = 0.2,
         enable_thinking: bool | None = None,
+        thinking_budget: int | None = None,
     ) -> Iterator[StreamDelta]:
         if not self.api_key:
             raise QwenError("Missing API key. Set DASHSCOPE_API_KEY in .env or system environment.")
@@ -83,12 +88,14 @@ class QwenClient:
                 messages,
                 temperature=temperature,
                 enable_thinking=enable_thinking,
+                thinking_budget=thinking_budget,
             )
             return
         yield from self._stream_complete_openai_compatible(
             messages,
             temperature=temperature,
             enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
         )
 
     def complete_with_images(
@@ -98,6 +105,7 @@ class QwenClient:
         *,
         temperature: float = 0.2,
         enable_thinking: bool | None = None,
+        thinking_budget: int | None = None,
     ) -> str:
         messages: list[Message] = [
             {
@@ -113,6 +121,7 @@ class QwenClient:
             messages,
             temperature=temperature,
             enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
         )
 
     def _compatible_client(self) -> QwenClient:
@@ -199,6 +208,7 @@ class QwenClient:
         *,
         temperature: float,
         enable_thinking: bool | None,
+        thinking_budget: int | None,
     ) -> str:
         url = f"{self.base_url}/services/aigc/text-generation/generation"
         parameters: dict[str, Any] = {
@@ -207,6 +217,8 @@ class QwenClient:
         }
         if enable_thinking is not None:
             parameters["enable_thinking"] = enable_thinking
+        if thinking_budget is not None:
+            parameters["thinking_budget"] = int(thinking_budget)
         payload = {
             "model": self.model,
             "input": {"messages": messages},
@@ -224,6 +236,7 @@ class QwenClient:
         *,
         temperature: float,
         enable_thinking: bool | None,
+        thinking_budget: int | None,
     ) -> str:
         url = f"{self.base_url}/chat/completions"
         payload = {
@@ -233,6 +246,8 @@ class QwenClient:
         }
         if enable_thinking is not None:
             payload["enable_thinking"] = enable_thinking
+        if thinking_budget is not None:
+            payload["thinking_budget"] = int(thinking_budget)
         result = self._post_json(url, payload)
         try:
             return result["choices"][0]["message"]["content"]
@@ -245,6 +260,7 @@ class QwenClient:
         *,
         temperature: float,
         enable_thinking: bool | None,
+        thinking_budget: int | None,
     ) -> Iterator[StreamDelta]:
         url = f"{self.base_url}/chat/completions"
         payload = {
@@ -255,6 +271,8 @@ class QwenClient:
         }
         if enable_thinking is not None:
             payload["enable_thinking"] = enable_thinking
+        if thinking_budget is not None:
+            payload["thinking_budget"] = int(thinking_budget)
         yield from self._post_json_stream(url, payload)
 
     @staticmethod

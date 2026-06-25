@@ -26,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offline", action="store_true", help="Use a tiny local planner for smoke tests without API calls.")
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum sense-think-act iterations.")
     parser.add_argument("--json", action="store_true", help="Print raw event JSON lines.")
-    parser.add_argument("--verbose", action="store_true", help="Also show full tool args.")
+    parser.add_argument("--verbose", action="store_true", help="Show full reasoning, model input/output, and tool args.")
     parser.add_argument("--no-stream", action="store_true", help="Disable streaming model output.")
     parser.add_argument("--image", action="append", default=[], help="Attach a local image path for multimodal tasks. Repeat for multiple images.")
     parser.add_argument("--version", action="version", version=f"pawlite {__version__}")
@@ -147,6 +147,7 @@ def _print_event_stream(events, *, raw_json: bool = False, verbose: bool = False
                 streaming_segment=streaming_segment,
                 streaming_had_reasoning=streaming_had_reasoning,
                 streaming_reasoning_chars=streaming_reasoning_chars,
+                verbose=verbose,
             )
         elif event.kind == "planner":
             if streaming_role == "planner":
@@ -173,6 +174,7 @@ def _print_event_stream(events, *, raw_json: bool = False, verbose: bool = False
                 streaming_segment=streaming_segment,
                 streaming_had_reasoning=streaming_had_reasoning,
                 streaming_reasoning_chars=streaming_reasoning_chars,
+                verbose=verbose,
             )
         elif event.kind == "executor_model":
             if streaming_role == "executor":
@@ -189,13 +191,21 @@ def _print_event_stream(events, *, raw_json: bool = False, verbose: bool = False
             tool = event.payload["tool"]
             args = event.payload.get("args") or {}
             print(f"· tool: {_format_tool_line(tool, args)}", flush=True)
-            if verbose and args:
-                print(f"  args: {json.dumps(args, ensure_ascii=False)}", flush=True)
+            if verbose:
+                _print_verbose_json("tool JSON", event.payload)
         elif event.kind == "executor_finish":
             report = event.payload.get("report") or {}
             summary = report.get("summary", "")
             if summary:
                 print(f"· done: {summary}", flush=True)
+        elif event.kind == "model_input":
+            continue
+        elif event.kind == "model_output":
+            if verbose:
+                actor = event.payload.get("actor", "model")
+                content = event.payload.get("content") or ""
+                label = "Planner output JSON" if actor == "planner" else "Executor output JSON"
+                print(f"\n[verbose] {label}:\n{content}", flush=True)
         elif event.kind == "model_start":
             if verbose:
                 print(f"\n[model step {event.payload['step']}] thinking...", flush=True)
@@ -222,22 +232,32 @@ def _print_stream_delta(
     streaming_segment: str | None,
     streaming_had_reasoning: bool,
     streaming_reasoning_chars: int,
+    verbose: bool = False,
 ) -> tuple[str | None, bool, int]:
     reasoning = event.payload.get("reasoning") or ""
     if reasoning:
         if streaming_segment != "reasoning":
             print(f"· reasoning: ", end="", flush=True)
             streaming_segment = "reasoning"
-        remaining = REASONING_MAX_CHARS - streaming_reasoning_chars
-        if remaining > 0:
-            visible = reasoning[:remaining]
-            print(visible, end="", flush=True)
-            streaming_reasoning_chars += len(visible)
-            if len(reasoning) > remaining:
-                print("...<省略>", end="", flush=True)
-                streaming_reasoning_chars = REASONING_MAX_CHARS
+        if verbose:
+            print(reasoning, end="", flush=True)
+            streaming_reasoning_chars += len(reasoning)
+        else:
+            remaining = REASONING_MAX_CHARS - streaming_reasoning_chars
+            if remaining > 0:
+                visible = reasoning[:remaining]
+                print(visible, end="", flush=True)
+                streaming_reasoning_chars += len(visible)
+                if len(reasoning) > remaining:
+                    print("...<省略>", end="", flush=True)
+                    streaming_reasoning_chars = REASONING_MAX_CHARS
         streaming_had_reasoning = True
     return streaming_segment, streaming_had_reasoning, streaming_reasoning_chars
+
+
+def _print_verbose_json(label: str, payload: object) -> None:
+    print(f"\n[verbose] {label}:", flush=True)
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
 
 
 if __name__ == "__main__":
