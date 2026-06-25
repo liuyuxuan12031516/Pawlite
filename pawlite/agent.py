@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterator
 
 from .config import Config
@@ -14,9 +15,11 @@ from .skills import SkillContext, SkillRegistry, format_observation
 PLANNER_SYSTEM_PROMPT = """You are the Pawlite planner and supervisor.
 Your goal is to run a general local personal assistant, not a task-specific report bot.
 
-You do not inspect files, parse large content, or run tools yourself. Keep the overall goal,
-plan, step status, and executor feedback. Delegate exactly one bounded piece of work at a
-time to a fresh executor agent, then use the executor's compact report to decide the next step.
+You do not inspect user files, parse large content, or run executor tools yourself. You may
+request external skill documents with read_skill when the external skill catalog is relevant.
+The runtime will return the skill document as an executor report. Keep the overall goal, plan,
+step status, and executor feedback. Delegate exactly one bounded piece of work at a time to a
+fresh executor agent, then use the executor's compact report to decide the next step.
 Return ONLY one JSON object, no markdown, no commentary.
 
 JSON protocol:
@@ -34,6 +37,11 @@ JSON protocol:
         "expected_artifacts": ["paths or artifact descriptions if applicable"]
       },
       "reason": "why this subtask is the next best step"
+    },
+    {
+      "type": "read_skill",
+      "name": "skill name from the external skill catalog",
+      "reason": "why this skill document is needed before planning further"
     }
   ]
 }
@@ -41,6 +49,7 @@ JSON protocol:
 Rules:
 - Keep thought to one short sentence. Do not include chain-of-thought, self-correction, format checks, or "I will output" commentary.
 - Decide silently first, then return only the JSON object.
+- Use read_skill sparingly, only when the external skill catalog strongly matches the task. It is handled by the runtime and returned as an executor report.
 - Delegate at most one subtask per planner step unless the subtasks are tiny and independent.
 - Keep each delegated subtask small enough for the executor step budget. Prefer focused batches over one oversized "read everything" task.
 - Do not ask the executor to return raw source text. Ask it to write compact intermediate notes when evidence is long.
@@ -103,6 +112,7 @@ Rules:
 
 OLD_OBSERVATION_MAX_CHARS = 4000
 RECENT_OBSERVATIONS_TO_KEEP = 1
+PLANNER_SKILL_DESCRIPTION_MAX_CHARS = 500
 REPORT_KEYS = ("task_title", "status", "summary", "artifacts", "coverage", "limitations", "suggested_next_steps")
 RESULT_SUMMARY_KEYS = (
     "error",
@@ -213,6 +223,31 @@ class PawliteAgent:
 
             reports_this_step = []
             for index, action in enumerate(actions, start=1):
+                if self._is_read_skill_action(action):
+                    reason = action.get("reason", "") if isinstance(action, dict) else ""
+                    name = str(action.get("name") or action.get("skill") or "").strip()
+                    title = f"Read skill: {name or 'unknown'}"
+                    yield AgentEvent(
+                        "executor_start",
+                        {
+                            "planner_step": planner_step,
+                            "executor_index": index,
+                            "title": title,
+                            "reason": reason,
+                        },
+                    )
+                    report = self._read_planner_skill_report(name)
+                    reports_this_step.append(report)
+                    yield AgentEvent(
+                        "executor_finish",
+                        {
+                            "planner_step": planner_step,
+                            "executor_index": index,
+                            "report": report,
+                        },
+                    )
+                    continue
+
                 work_order = self._work_order_from_action(action)
                 reason = action.get("reason", "") if isinstance(action, dict) else ""
                 yield AgentEvent(
@@ -252,12 +287,14 @@ class PawliteAgent:
         manifest = json.dumps(self.skills.manifest, ensure_ascii=False, indent=2)
         recent_memory = json.dumps(self.memory.recent(), ensure_ascii=False, indent=2)
         workflow = json.dumps(self._planner_workflow_guidance(), ensure_ascii=False, indent=2)
+        planner_skills = json.dumps(self._planner_skill_catalog(), ensure_ascii=False, indent=2)
         return (
             f"Workspace: {self.config.workspace}\n"
             f"Language: {self.config.language}\n"
             f"Language policy: Think, plan, tool-written reports, summaries, and final answers should use {self.config.language} unless the user explicitly requests another language. Keep JSON keys unchanged.\n"
             f"Task: {task}\n\n"
             f"Planner-only workflow guidance:\n{workflow}\n\n"
+            f"External planner skill catalog (summaries only; request read_skill by name only when relevant):\n{planner_skills}\n\n"
             f"Executor available skills:\n{manifest}\n\n"
             f"Recent memory:\n{recent_memory}"
         )
@@ -299,6 +336,101 @@ class PawliteAgent:
             ],
         }
 
+    def _planner_skill_catalog(self) -> list[dict[str, str]]:
+        skills_root = (self.config.workspace / "skills").resolve()
+        if not skills_root.is_dir():
+            return []
+
+        catalog: list[dict[str, str]] = []
+        for skill_dir in sorted(path for path in skills_root.iterdir() if path.is_dir()):
+            skill_file = skill_dir / "SKILL.md"
+            if not skill_file.is_file():
+                continue
+            try:
+                header = skill_file.read_text(encoding="utf-8", errors="replace")[:4000]
+            except OSError:
+                continue
+            metadata = self._parse_skill_frontmatter(header)
+            name = metadata.get("name") or skill_dir.name
+            description = metadata.get("description", "")
+            catalog.append(
+                {
+                    "name": name[:120],
+                    "description": description[:PLANNER_SKILL_DESCRIPTION_MAX_CHARS],
+                    "path": self._workspace_relative_path(skill_file),
+                }
+            )
+        return catalog
+
+    @staticmethod
+    def _is_read_skill_action(action: Any) -> bool:
+        return isinstance(action, dict) and action.get("type") == "read_skill"
+
+    def _read_planner_skill_report(self, name: str) -> dict[str, Any]:
+        doc = self._read_planner_skill(name)
+        if doc.get("ok") != "true":
+            return {
+                "task_title": f"Read skill: {name or 'unknown'}",
+                "status": "blocked",
+                "summary": doc.get("error", "Planner skill could not be read."),
+                "artifacts": [],
+                "coverage": [],
+                "limitations": [doc.get("error", "Planner skill not found.")],
+                "suggested_next_steps": [],
+            }
+
+        return {
+            "task_title": f"Read skill: {doc['name']}",
+            "status": "completed",
+            "summary": f"Read external planner skill {doc['name']} from {doc['path']}.",
+            "artifacts": [doc["path"]],
+            "coverage": [f"Full SKILL.md content loaded for {doc['name']}."],
+            "limitations": [],
+            "suggested_next_steps": [],
+            "content": doc["content"],
+        }
+
+    def _read_planner_skill(self, name: str) -> dict[str, str]:
+        for item in self._planner_skill_catalog():
+            if name not in {item["name"], Path(item["path"]).parent.name}:
+                continue
+            skill_file = (self.config.workspace / item["path"]).resolve()
+            try:
+                content = skill_file.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                return {"name": name, "ok": "false", "error": str(exc)}
+            return {
+                "name": item["name"],
+                "ok": "true",
+                "path": item["path"],
+                "content": content,
+            }
+        return {"name": name, "ok": "false", "error": "Planner skill not found in skills/*/SKILL.md."}
+
+    @staticmethod
+    def _parse_skill_frontmatter(text: str) -> dict[str, str]:
+        if not text.startswith("---"):
+            return {}
+        match = re.match(r"---\s*\n(.*?)\n---", text, flags=re.S)
+        if not match:
+            return {}
+
+        metadata: dict[str, str] = {}
+        for line in match.group(1).splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            if key in {"name", "description"}:
+                metadata[key] = value.strip().strip("\"'")
+        return metadata
+
+    def _workspace_relative_path(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(self.config.workspace).as_posix()
+        except ValueError:
+            return path.name
+
     def _executor_user_message(self, task: str, work_order: dict[str, Any], planner_step: int, executor_index: int) -> str:
         manifest = json.dumps(self.skills.manifest, ensure_ascii=False, indent=2)
         recent_memory = json.dumps(self.memory.recent(), ensure_ascii=False, indent=2)
@@ -339,6 +471,7 @@ class PawliteAgent:
             role_rules = (
                 "- 只给下一步决策：继续委托一个小任务，或在已确认完成时 final。\n"
                 "- 每个委托任务要适合 executor 的步数预算；文件很多时按小批次推进。\n"
+                "- 只有外部 skill 目录摘要明显相关时，才使用 read_skill；运行时会把文档内容作为 executor report 返回。\n"
                 "- 不要因为已有 memory 就跳过用户明确要求的读取/验证步骤，除非 final 中说明限制。"
             )
         else:
