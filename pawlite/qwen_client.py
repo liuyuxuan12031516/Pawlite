@@ -124,6 +124,36 @@ class QwenClient:
             thinking_budget=thinking_budget,
         )
 
+    def web_search(
+        self,
+        query: str,
+        *,
+        search_strategy: str = "agent",
+        temperature: float = 0.2,
+    ) -> str:
+        if not self.api_key:
+            raise QwenError("Missing API key. Set DASHSCOPE_API_KEY in .env or system environment.")
+        messages: list[Message] = [
+            {
+                "role": "user",
+                "content": query,
+            }
+        ]
+        extra_body: dict[str, Any] = {"enable_search": True}
+        if search_strategy:
+            extra_body["search_options"] = {"search_strategy": search_strategy}
+        client = self._compatible_client() if self._uses_dashscope_native_api() else self
+        return "".join(
+            delta.get("content", "")
+            for delta in client._stream_complete_openai_compatible(
+                messages,
+                temperature=temperature,
+                enable_thinking=False,
+                thinking_budget=None,
+                extra_body=extra_body,
+            )
+        )
+
     def _compatible_client(self) -> QwenClient:
         fallback_base_url = self.base_url
         if self._uses_dashscope_native_api():
@@ -237,17 +267,16 @@ class QwenClient:
         temperature: float,
         enable_thinking: bool | None,
         thinking_budget: int | None,
+        extra_body: dict[str, Any] | None = None,
     ) -> str:
         url = f"{self.base_url}/chat/completions"
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        if enable_thinking is not None:
-            payload["enable_thinking"] = enable_thinking
-        if thinking_budget is not None:
-            payload["thinking_budget"] = int(thinking_budget)
+        payload = self._chat_payload(
+            messages,
+            temperature=temperature,
+            enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
+            extra_body=extra_body,
+        )
         result = self._post_json(url, payload)
         try:
             return result["choices"][0]["message"]["content"]
@@ -261,19 +290,43 @@ class QwenClient:
         temperature: float,
         enable_thinking: bool | None,
         thinking_budget: int | None,
+        extra_body: dict[str, Any] | None = None,
     ) -> Iterator[StreamDelta]:
         url = f"{self.base_url}/chat/completions"
+        payload = self._chat_payload(
+            messages,
+            temperature=temperature,
+            stream=True,
+            enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
+            extra_body=extra_body,
+        )
+        yield from self._post_json_stream(url, payload)
+
+    def _chat_payload(
+        self,
+        messages: list[Message],
+        *,
+        temperature: float,
+        stream: bool = False,
+        enable_thinking: bool | None = None,
+        thinking_budget: int | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "stream": True,
         }
+        if stream:
+            payload["stream"] = True
         if enable_thinking is not None:
             payload["enable_thinking"] = enable_thinking
         if thinking_budget is not None:
             payload["thinking_budget"] = int(thinking_budget)
-        yield from self._post_json_stream(url, payload)
+        if extra_body:
+            payload.update(extra_body)
+        return payload
 
     @staticmethod
     def _extract_stream_delta(chunk: dict[str, Any]) -> StreamDelta:

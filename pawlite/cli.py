@@ -90,6 +90,9 @@ def _format_tool_line(tool: str, args: dict) -> str:
         return f"{tool}({args.get('path', '.')})"
     if tool in {"search_files", "find_images", "read_excel", "read_excel_directory"}:
         return f"{tool}({args.get('path') or args.get('root', '')})"
+    if tool == "web_search":
+        query = str(args.get("query", ""))
+        return f"{tool}({query[:80]}{'...' if len(query) > 80 else ''})"
     if tool == "describe_image":
         paths = args.get("paths")
         if isinstance(paths, list):
